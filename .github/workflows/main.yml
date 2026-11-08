@@ -1,15 +1,19 @@
-name: macOS Sunshine + Cloudflare Mesh (experimental)
+name: macOS Sunshine + Tailscale (experimental)
 
 on:
   workflow_dispatch:
     inputs:
       minutes:
-        description: 'Diagnostic runtime (5-180 minutes)'
+        description: 'Runtime (5-180 minutes)'
         required: true
         default: '30'
 
 permissions:
   contents: read
+
+env:
+  SUN_USER: ${{ secrets.SUNSHINE_USER || 'sunshine' }}
+  SUN_PASS: ${{ secrets.SUNSHINE_PASS || 'Sunshine@2026' }}
 
 jobs:
   macos:
@@ -17,66 +21,61 @@ jobs:
     timeout-minutes: 190
     steps:
       - name: System details
-        shell: bash
         run: |
           sw_vers
           uname -m
           system_profiler SPDisplaysDataType || true
           echo "Console user: $(stat -f %Su /dev/console)"
 
+      - name: Connect Tailscale
+        uses: tailscale/github-action@v3
+        with:
+          authkey: ${{ secrets.TS_AUTHKEY }}
+          hostname: gh-macos-sunshine
+
       - name: Install Sunshine
-        shell: bash
         run: |
-          mkdir -p "$RUNNER_TEMP/sunshine-diagnostics"
+          mkdir -p "$RUNNER_TEMP/diag"
           brew tap LizardByte/homebrew
-          brew trust lizardbyte/homebrew
-          brew install sunshine 2>&1 | tee "$RUNNER_TEMP/sunshine-diagnostics/install-sunshine.log"
-          command -v sunshine || true
-          ls -ld /Applications/Sunshine.app 2>/dev/null || true
+          brew install lizardbyte/homebrew/sunshine 2>&1 | tee "$RUNNER_TEMP/diag/install.log"
+          command -v sunshine
 
-      - name: Install Cloudflare One Client
-        shell: bash
+      - name: Start Sunshine
         run: |
-          brew install --cask cloudflare-warp || true
-          command -v warp-cli || true
-          ls -ld '/Applications/Cloudflare WARP.app' 2>/dev/null || true
-
-      - name: Check Mesh enrollment prerequisites
-        shell: bash
-        env:
-          CF_MESH_TEAM: ${{ secrets.CF_MESH_TEAM }}
-          CF_MESH_CLIENT_ID: ${{ secrets.CF_MESH_CLIENT_ID }}
-          CF_MESH_CLIENT_SECRET: ${{ secrets.CF_MESH_CLIENT_SECRET }}
-        run: |
-          if [[ -z "$CF_MESH_TEAM" || -z "$CF_MESH_CLIENT_ID" || -z "$CF_MESH_CLIENT_SECRET" ]]; then
-            echo 'Mesh not enrolled: macOS headless clients require a Zero Trust team and service-token deployment configuration.'
-            echo 'A Linux Mesh node connector token is NOT a macOS client enrollment token.'
-          else
-            echo 'Mesh client credentials supplied. Enrollment requires a managed macOS headless deployment profile.'
-            echo 'This workflow does not silently apply an unverified device-management profile.'
-          fi
-          warp-cli status || true
-
-      - name: Try Sunshine and record diagnostics
-        shell: bash
-        run: |
-          mkdir -p "$RUNNER_TEMP/sunshine-diagnostics"
-          (sunshine > "$RUNNER_TEMP/sunshine-diagnostics/sunshine.log" 2>&1 & echo $! > "$RUNNER_TEMP/sunshine-diagnostics/pid") || true
+          sunshine --creds "$SUN_USER" "$SUN_PASS"
+          nohup sunshine > "$RUNNER_TEMP/diag/sunshine.log" 2>&1 < /dev/null &
           sleep 12
-          pgrep -fl sunshine || true
-          (curl -k -I --connect-timeout 3 https://127.0.0.1:47990 || true) | tee "$RUNNER_TEMP/sunshine-diagnostics/webui.txt"
-          (warp-cli status || true) > "$RUNNER_TEMP/sunshine-diagnostics/warp-status.txt" 2>&1
-          echo 'NOTE: Screen Recording/Input permissions and an active desktop session are not guaranteed on hosted macOS runners.'
+          pgrep -fl sunshine
+          curl -k -I --connect-timeout 3 https://127.0.0.1:47990 | tee "$RUNNER_TEMP/diag/webui.txt"
 
-      - name: Hold runner for inspection
-        shell: bash
+      - name: Generate Tailscale links
+        run: |
+          TS_IP="$(tailscale ip -4 | head -n1)"
+          TS_DNS="$(tailscale status --json | jq -r '.Self.DNSName' | sed 's/\.$//')"
+
+          {
+            echo "## Sunshine + Tailscale"
+            echo ""
+            echo "| Item | Valor |"
+            echo "|------|-------|"
+            echo "| Web UI (IP) | https://$TS_IP:47990 |"
+            echo "| Web UI (DNS) | https://$TS_DNS:47990 |"
+            echo "| Moonlight (adicionar host) | $TS_IP |"
+            echo "| Usuário | $SUN_USER |"
+            echo "| Senha | $SUN_PASS |"
+          } | tee -a "$GITHUB_STEP_SUMMARY" "$RUNNER_TEMP/diag/links.md"
+
+          echo ""
+          echo "==> Web UI: https://$TS_IP:47990"
+          echo "==> Moonlight: $TS_IP"
+
+      - name: Hold runner
         env:
           REQUESTED_MINUTES: ${{ inputs.minutes }}
         run: |
-          if [[ ! "$REQUESTED_MINUTES" =~ ^[0-9]+$ ]]; then exit 1; fi
+          [[ "$REQUESTED_MINUTES" =~ ^[0-9]+$ ]] || exit 1
           n=$((10#$REQUESTED_MINUTES))
-          if (( n < 5 || n > 180 )); then echo 'minutes must be 5-180'; exit 1; fi
-          echo "Waiting $n minutes. This is NOT a persistent Mac or a confirmed Moonlight streaming host."
+          (( n >= 5 && n <= 180 )) || { echo 'minutes must be 5-180'; exit 1; }
           sleep "$((n * 60))"
 
       - name: Upload diagnostics
@@ -84,5 +83,5 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: macos-sunshine-diagnostics
-          path: ${{ runner.temp }}/sunshine-diagnostics/
+          path: ${{ runner.temp }}/diag/
           if-no-files-found: ignore
