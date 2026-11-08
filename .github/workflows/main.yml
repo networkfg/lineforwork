@@ -1,4 +1,4 @@
-name: macOS Sunshine + Tailscale (experimental)
+name: macOS VNC + Tailscale (experimental)
 
 on:
   workflow_dispatch:
@@ -12,8 +12,8 @@ permissions:
   contents: read
 
 env:
-  SUN_USER: ${{ secrets.SUNSHINE_USER || 'sunshine' }}
-  SUN_PASS: ${{ secrets.SUNSHINE_PASS || 'Sunshine@2026' }}
+  # Senha VNC legada aceita no maximo 8 caracteres
+  VNC_PASS: ${{ secrets.VNC_PASS || 'Vnc@2026' }}
 
 jobs:
   macos:
@@ -25,98 +25,56 @@ jobs:
           sw_vers
           uname -m
           system_profiler SPDisplaysDataType || true
-          echo "Console user: $(stat -f %Su /dev/console)"
+          echo "Usuario: $(whoami)"
 
       - name: Connect Tailscale
         uses: tailscale/github-action@v3
         with:
           authkey: ${{ secrets.TS_AUTHKEY }}
-          hostname: gh-macos-sunshine
+          hostname: gh-macos-vnc
 
-      - name: Install Sunshine
-        timeout-minutes: 30
-        env:
-          HOMEBREW_NO_INSTALL_CLEANUP: 1
-          HOMEBREW_NO_ENV_HINTS: 1
-          HOMEBREW_NO_AUTO_UPDATE: 1
-          NONINTERACTIVE: 1
+      - name: Enable Screen Sharing (VNC)
         run: |
-          set -o pipefail
           mkdir -p "$RUNNER_TEMP/diag"
 
-          curl -s https://api.github.com/repos/LizardByte/Sunshine/releases/latest \
-            > "$RUNNER_TEMP/diag/release.json"
-          jq -r '.assets[].name' "$RUNNER_TEMP/diag/release.json" | tee "$RUNNER_TEMP/diag/assets.txt"
+          # Define a senha do usuario da sessao (usada no login do Screen Sharing)
+          sudo dscl . -passwd "/Users/$(whoami)" "$VNC_PASS" || true
 
-          URL="$(jq -r '.assets[] | select(.name | test("macos|darwin|\\.dmg"; "i")) | .browser_download_url' \
-            "$RUNNER_TEMP/diag/release.json" | head -n1)"
+          # Ativa Remote Management / VNC com senha
+          sudo /System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/Resources/kickstart \
+            -activate -configure -access -on \
+            -clientopts -setvnclegacy -vnclegacy yes \
+            -clientopts -setvncpw -vncpw "$VNC_PASS" \
+            -restart -agent -privs -all 2>&1 | tee "$RUNNER_TEMP/diag/kickstart.log"
 
-          if [ -n "$URL" ]; then
-            echo "Binario pronto encontrado: $URL"
-            FILE="$RUNNER_TEMP/$(basename "$URL")"
-            curl -L "$URL" -o "$FILE"
-            case "$FILE" in
-              *.pkg)
-                sudo installer -pkg "$FILE" -target /
-                ;;
-              *.dmg)
-                MNT="$(hdiutil attach "$FILE" -nobrowse | grep -o '/Volumes/.*' | head -n1)"
-                echo "Montado em: $MNT"
-                APP="$(find "$MNT" -maxdepth 2 -name '*.app' | head -n1)"
-                sudo cp -R "$APP" /Applications/
-                hdiutil detach "$MNT" || true
-                ;;
-              *.tar.gz|*.zip)
-                echo "Arquivo compactado, veja assets.txt para ajustar a extracao"
-                exit 1
-                ;;
-            esac
-          else
-            echo "Sem binario macOS na release. Compilando via Homebrew (lento)..."
-            brew tap LizardByte/homebrew
-            brew install icu4c@78 || true
-            brew install lizardbyte/homebrew/sunshine 2>&1 | tee "$RUNNER_TEMP/diag/install.log"
-          fi
+          # Tenta tambem o Screen Sharing nativo
+          sudo launchctl enable system/com.apple.screensharing 2>/dev/null || true
+          sudo launchctl load -w /System/Library/LaunchDaemons/com.apple.screensharing.plist 2>/dev/null || true
 
-          command -v sunshine || ls -ld /Applications/Sunshine.app
-
-      - name: Start Sunshine
-        run: |
-          SUN_BIN="$(command -v sunshine || true)"
-          if [ -z "$SUN_BIN" ]; then
-            SUN_BIN="/Applications/Sunshine.app/Contents/MacOS/sunshine"
-          fi
-          echo "Usando: $SUN_BIN"
-
-          "$SUN_BIN" --creds "$SUN_USER" "$SUN_PASS" || true
-          nohup "$SUN_BIN" > "$RUNNER_TEMP/diag/sunshine.log" 2>&1 < /dev/null &
-          echo $! > "$RUNNER_TEMP/diag/pid"
-          sleep 15
-
-          pgrep -fl sunshine || { echo "Sunshine nao esta rodando"; tail -n 50 "$RUNNER_TEMP/diag/sunshine.log"; exit 1; }
-          (curl -k -I --connect-timeout 3 https://127.0.0.1:47990 || true) | tee "$RUNNER_TEMP/diag/webui.txt"
-          tail -n 30 "$RUNNER_TEMP/diag/sunshine.log" || true
+          sleep 8
+          echo "--- Portas ---"
+          sudo lsof -iTCP:5900 -sTCP:LISTEN | tee "$RUNNER_TEMP/diag/port5900.txt" || echo "Porta 5900 NAO esta escutando"
+          nc -zv 127.0.0.1 5900 2>&1 | tee -a "$RUNNER_TEMP/diag/port5900.txt" || true
 
       - name: Generate Tailscale links
         run: |
           TS_IP="$(tailscale ip -4 | head -n1)"
           TS_DNS="$(tailscale status --json | jq -r '.Self.DNSName' | sed 's/\.$//')"
+          USER_NAME="$(whoami)"
 
           {
-            echo "## Sunshine + Tailscale"
+            echo "## VNC + Tailscale"
             echo ""
             echo "| Item | Valor |"
             echo "|------|-------|"
-            echo "| Web UI (IP) | https://$TS_IP:47990 |"
-            echo "| Web UI (DNS) | https://$TS_DNS:47990 |"
-            echo "| Moonlight (adicionar host) | $TS_IP |"
-            echo "| Usuario | $SUN_USER |"
-            echo "| Senha | $SUN_PASS |"
+            echo "| Endereco VNC (IP) | vnc://$TS_IP:5900 |"
+            echo "| Endereco VNC (DNS) | vnc://$TS_DNS:5900 |"
+            echo "| Usuario (login Mac) | $USER_NAME |"
+            echo "| Senha | $VNC_PASS |"
           } | tee -a "$GITHUB_STEP_SUMMARY" "$RUNNER_TEMP/diag/links.md"
 
           echo ""
-          echo "==> Web UI: https://$TS_IP:47990"
-          echo "==> Moonlight: $TS_IP"
+          echo "==> Conecte em: vnc://$TS_IP:5900"
 
       - name: Hold runner
         env:
@@ -132,6 +90,6 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: macos-sunshine-diagnostics
+          name: macos-vnc-diagnostics
           path: ${{ runner.temp }}/diag/
           if-no-files-found: ignore
