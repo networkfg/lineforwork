@@ -27,8 +27,10 @@ jobs:
       - name: Install Sunshine
         shell: bash
         run: |
+          mkdir -p "$RUNNER_TEMP/sunshine-diagnostics"
           brew tap LizardByte/homebrew
-          brew install sunshine
+          brew trust lizardbyte/homebrew
+          brew install sunshine 2>&1 | tee "$RUNNER_TEMP/sunshine-diagnostics/install-sunshine.log"
           command -v sunshine || true
           ls -ld /Applications/Sunshine.app 2>/dev/null || true
 
