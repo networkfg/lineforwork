@@ -34,41 +34,68 @@ jobs:
           hostname: gh-macos-sunshine
 
       - name: Install Sunshine
+        timeout-minutes: 30
+        env:
+          HOMEBREW_NO_INSTALL_CLEANUP: 1
+          HOMEBREW_NO_ENV_HINTS: 1
+          HOMEBREW_NO_AUTO_UPDATE: 1
+          NONINTERACTIVE: 1
         run: |
+          set -o pipefail
           mkdir -p "$RUNNER_TEMP/diag"
 
-          # remove taps quebrados que poluem o log
-          brew untap hashicorp/tap 2>/dev/null || true
-          brew untap aws/tap 2>/dev/null || true
+          curl -s https://api.github.com/repos/LizardByte/Sunshine/releases/latest \
+            > "$RUNNER_TEMP/diag/release.json"
+          jq -r '.assets[].name' "$RUNNER_TEMP/diag/release.json" | tee "$RUNNER_TEMP/diag/assets.txt"
 
-          brew update 2>&1 | tail -n 5
-          brew tap LizardByte/homebrew
+          URL="$(jq -r '.assets[] | select(.name | test("macos|darwin|\\.dmg"; "i")) | .browser_download_url' \
+            "$RUNNER_TEMP/diag/release.json" | head -n1)"
 
-          if brew install lizardbyte/homebrew/sunshine 2>&1 | tee "$RUNNER_TEMP/diag/install.log"; then
-            echo "Sunshine instalado via Homebrew"
+          if [ -n "$URL" ]; then
+            echo "Binario pronto encontrado: $URL"
+            FILE="$RUNNER_TEMP/$(basename "$URL")"
+            curl -L "$URL" -o "$FILE"
+            case "$FILE" in
+              *.pkg)
+                sudo installer -pkg "$FILE" -target /
+                ;;
+              *.dmg)
+                MNT="$(hdiutil attach "$FILE" -nobrowse | grep -o '/Volumes/.*' | head -n1)"
+                echo "Montado em: $MNT"
+                APP="$(find "$MNT" -maxdepth 2 -name '*.app' | head -n1)"
+                sudo cp -R "$APP" /Applications/
+                hdiutil detach "$MNT" || true
+                ;;
+              *.tar.gz|*.zip)
+                echo "Arquivo compactado, veja assets.txt para ajustar a extracao"
+                exit 1
+                ;;
+            esac
           else
-            echo "Homebrew falhou, tentando instalar icu4c@78 e refazer..."
+            echo "Sem binario macOS na release. Compilando via Homebrew (lento)..."
+            brew tap LizardByte/homebrew
             brew install icu4c@78 || true
-            brew install lizardbyte/homebrew/sunshine 2>&1 | tee -a "$RUNNER_TEMP/diag/install.log" || {
-              echo "Fallback: baixando release oficial"
-              URL="$(curl -s https://api.github.com/repos/LizardByte/Sunshine/releases/latest \
-                | jq -r '.assets[] | select(.name | test("macos|darwin|\\.dmg"; "i")) | .browser_download_url' | head -n1)"
-              echo "Asset: $URL"
-              [ -n "$URL" ] || { echo "Nenhum asset macOS encontrado na release"; exit 1; }
-              curl -L "$URL" -o "$RUNNER_TEMP/sunshine.pkg_or_dmg"
-              ls -lh "$RUNNER_TEMP/sunshine.pkg_or_dmg"
-            }
+            brew install lizardbyte/homebrew/sunshine 2>&1 | tee "$RUNNER_TEMP/diag/install.log"
           fi
 
-          command -v sunshine || ls -ld /Applications/Sunshine.app 2>/dev/null
+          command -v sunshine || ls -ld /Applications/Sunshine.app
 
       - name: Start Sunshine
         run: |
-          sunshine --creds "$SUN_USER" "$SUN_PASS"
-          nohup sunshine > "$RUNNER_TEMP/diag/sunshine.log" 2>&1 < /dev/null &
-          sleep 12
-          pgrep -fl sunshine
-          curl -k -I --connect-timeout 3 https://127.0.0.1:47990 | tee "$RUNNER_TEMP/diag/webui.txt"
+          SUN_BIN="$(command -v sunshine || true)"
+          if [ -z "$SUN_BIN" ]; then
+            SUN_BIN="/Applications/Sunshine.app/Contents/MacOS/sunshine"
+          fi
+          echo "Usando: $SUN_BIN"
+
+          "$SUN_BIN" --creds "$SUN_USER" "$SUN_PASS" || true
+          nohup "$SUN_BIN" > "$RUNNER_TEMP/diag/sunshine.log" 2>&1 < /dev/null &
+          echo $! > "$RUNNER_TEMP/diag/pid"
+          sleep 15
+
+          pgrep -fl sunshine || { echo "Sunshine nao esta rodando"; tail -n 50 "$RUNNER_TEMP/diag/sunshine.log"; exit 1; }
+          (curl -k -I --connect-timeout 3 https://127.0.0.1:47990 || true) | tee "$RUNNER_TEMP/diag/webui.txt"
+          tail -n 30 "$RUNNER_TEMP/diag/sunshine.log" || true
 
       - name: Generate Tailscale links
         run: |
@@ -83,7 +110,7 @@ jobs:
             echo "| Web UI (IP) | https://$TS_IP:47990 |"
             echo "| Web UI (DNS) | https://$TS_DNS:47990 |"
             echo "| Moonlight (adicionar host) | $TS_IP |"
-            echo "| Usuário | $SUN_USER |"
+            echo "| Usuario | $SUN_USER |"
             echo "| Senha | $SUN_PASS |"
           } | tee -a "$GITHUB_STEP_SUMMARY" "$RUNNER_TEMP/diag/links.md"
 
@@ -98,6 +125,7 @@ jobs:
           [[ "$REQUESTED_MINUTES" =~ ^[0-9]+$ ]] || exit 1
           n=$((10#$REQUESTED_MINUTES))
           (( n >= 5 && n <= 180 )) || { echo 'minutes must be 5-180'; exit 1; }
+          echo "Aguardando $n minutos..."
           sleep "$((n * 60))"
 
       - name: Upload diagnostics
