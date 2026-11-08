@@ -36,9 +36,31 @@ jobs:
       - name: Install Sunshine
         run: |
           mkdir -p "$RUNNER_TEMP/diag"
+
+          # remove taps quebrados que poluem o log
+          brew untap hashicorp/tap 2>/dev/null || true
+          brew untap aws/tap 2>/dev/null || true
+
+          brew update 2>&1 | tail -n 5
           brew tap LizardByte/homebrew
-          brew install lizardbyte/homebrew/sunshine 2>&1 | tee "$RUNNER_TEMP/diag/install.log"
-          command -v sunshine
+
+          if brew install lizardbyte/homebrew/sunshine 2>&1 | tee "$RUNNER_TEMP/diag/install.log"; then
+            echo "Sunshine instalado via Homebrew"
+          else
+            echo "Homebrew falhou, tentando instalar icu4c@78 e refazer..."
+            brew install icu4c@78 || true
+            brew install lizardbyte/homebrew/sunshine 2>&1 | tee -a "$RUNNER_TEMP/diag/install.log" || {
+              echo "Fallback: baixando release oficial"
+              URL="$(curl -s https://api.github.com/repos/LizardByte/Sunshine/releases/latest \
+                | jq -r '.assets[] | select(.name | test("macos|darwin|\\.dmg"; "i")) | .browser_download_url' | head -n1)"
+              echo "Asset: $URL"
+              [ -n "$URL" ] || { echo "Nenhum asset macOS encontrado na release"; exit 1; }
+              curl -L "$URL" -o "$RUNNER_TEMP/sunshine.pkg_or_dmg"
+              ls -lh "$RUNNER_TEMP/sunshine.pkg_or_dmg"
+            }
+          fi
+
+          command -v sunshine || ls -ld /Applications/Sunshine.app 2>/dev/null
 
       - name: Start Sunshine
         run: |
